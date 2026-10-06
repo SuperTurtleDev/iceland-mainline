@@ -47,7 +47,7 @@ jobs:
       - name: buildbl.sh
         run: bash scripts/buildbl.sh
 
-      - name: buildkernel.sh (after bl: initrd embeds bl's esp.img)
+      - name: "buildkernel.sh (after bl — initrd embeds bl's esp.img)"
         run: bash scripts/buildkernel.sh
 
       - name: collect kernel artifacts
