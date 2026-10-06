@@ -1,18 +1,15 @@
 name: main build
 
-# Main meta-repo CI.  Two independent chains run in PARALLEL:
+# Structure:
+#   checkout (前置, once for the whole workflow)
+#     └─> bl-kernel   ─┐  (buildbl -> buildkernel; initrd embeds bl's esp.img)
+#     └─> userspace   ─┤  (independent, parallel with bl-kernel)
+#            package  <┘  (single compressed archive of all products)
 #
-#   bl-kernel    buildbl.sh -> buildkernel.sh (kernel strictly after bl:
-#                the netdeploy initrd embeds bl's esp.img)
-#   userspace    builduserspace.sh
-#
-# The final ramdeploy assembly (blob packing) stays on the workstation
-# ./build.sh for now: it needs both chains' outputs on one machine and the
-# userspace sparse alone is ~4 GB of cross-job artifact transfer.  The
-# kernel artifacts needed for it are uploaded by the bl-kernel job.
-#
-# Phase scripts that are still owner stubs produce nothing; real build
-# failures fail the job.
+# The checkout job does the one recursive clone (submodules incl. the
+# kernel's nested linux/firmware) and ships the workspace as an artifact;
+# the build jobs extract it instead of cloning again.  The final job packs
+# every phase product into ONE tar.zst and uploads that.
 
 on:
   push:
@@ -25,11 +22,11 @@ permissions:
   contents: read
 
 jobs:
-  bl-kernel:
+  checkout:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     steps:
-      - name: reclaim disk (kernel tree + container are heavy)
+      - name: reclaim disk
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                        /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
@@ -39,59 +36,128 @@ jobs:
         with:
           submodules: recursive   # bootloader, kernel (+linux+firmware), userspace, container
 
+      - name: "pack workspace (git dirs included — builds read SOURCE_DATE_EPOCH)"
+        run: |
+          tar --use-compress-program='zstd -3 -T0' -cf ../workspace.tar.zst .
+          du -h ../workspace.tar.zst
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: workspace
+          retention-days: 1
+          compression-level: 0     # payload is already zstd
+          path: ../workspace.tar.zst
+
+  bl-kernel:
+    needs: checkout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: workspace }
+
+      - name: extract workspace
+        run: |
+          mkdir -p ws && tar --use-compress-program='zstd -T0' -xf workspace.tar.zst -C ws
+          rm workspace.tar.zst
+          df -h /
+
       - name: rootless podman prereqs
         run: |
           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
           podman info >/dev/null && echo podman-ok
 
       - name: buildbl.sh
+        working-directory: ws
         run: bash scripts/buildbl.sh
 
       - name: "buildkernel.sh (after bl — initrd embeds bl's esp.img)"
+        working-directory: ws
         run: bash scripts/buildkernel.sh
 
-      - name: collect kernel artifacts
+      - name: stage products
         run: |
-          K=../build/kernel
-          mkdir -p dist
-          cp "$K"/SHA256SUMS dist/ 2>/dev/null || true
-          cp "$K"/*.img "$K"/*.tar.gz dist/ 2>/dev/null || true
-          cp "$K"/initrd_deploy_net_*.cpio.zst dist/ 2>/dev/null || true
-          cp -r "$K"/debs "$K"/tools "$K"/ramdeploy dist/ 2>/dev/null || true
-          du -sh dist
+          K=ws/../build/kernel
+          mkdir -p out/kernel
+          cp "$K"/SHA256SUMS out/kernel/ 2>/dev/null || true
+          cp "$K"/*.img "$K"/*.tar.gz out/kernel/ 2>/dev/null || true
+          cp "$K"/initrd_deploy_net_*.cpio.zst out/kernel/ 2>/dev/null || true
+          cp -r "$K"/debs "$K"/tools "$K"/ramdeploy "$K"/charge out/kernel/ 2>/dev/null || true
+          # bootloader products for the package job (stub: nothing yet)
+          BL=ws/../build/bootloader
+          mkdir -p out/bootloader
+          cp "$BL"/TestBootApp.efi "$BL"/BootApp.efi "$BL"/BootUtil.efi "$BL"/esp.img \
+             out/bootloader/ 2>/dev/null || true
+          du -sh out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: kernel-${{ github.sha }}
-          retention-days: 14
-          if-no-files-found: error
-          path: dist
+          name: products-bl-kernel
+          retention-days: 3
+          path: out
 
   userspace:
+    needs: checkout
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+      - uses: actions/download-artifact@v4
+        with: { name: workspace }
+
+      - name: extract workspace
+        run: |
+          mkdir -p ws && tar --use-compress-program='zstd -T0' -xf workspace.tar.zst -C ws
+          rm workspace.tar.zst
 
       - name: builduserspace.sh
+        working-directory: ws
         run: bash scripts/builduserspace.sh
 
-      - name: collect userspace artifacts
+      - name: stage products
         run: |
-          U=../build/userspace
-          mkdir -p dist
-          # manifest only: the sparse rootfs images are multi-GB and stay
-          # reproducible from the userspace repo build
-          ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) > dist/SHA256SUMS.userspace || true
-          cp "$U"/SHA256SUMS dist/ 2>/dev/null || true
-          cp "$U"/buildinfo.txt dist/ 2>/dev/null || true
-          cat dist/SHA256SUMS.userspace 2>/dev/null || echo "no userspace outputs (stub phase?)"
+          U=ws/../build/userspace
+          mkdir -p out/userspace
+          ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) > out/userspace/SHA256SUMS.images || true
+          cp "$U"/SHA256SUMS "$U"/buildinfo.txt out/userspace/ 2>/dev/null || true
+          cat out/userspace/SHA256SUMS.images 2>/dev/null || echo "no userspace outputs (stub phase?)"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: userspace-${{ github.sha }}
-          retention-days: 14
+          name: products-userspace
+          retention-days: 3
           if-no-files-found: ignore
+          path: out
+
+  package:
+    needs: [bl-kernel, userspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: products-bl-kernel, path: products }
+      - uses: actions/download-artifact@v4
+        with: { name: products-userspace, path: products }
+
+      - name: single product archive
+        run: |
+          # the ramdeploy boot set from the assembly contract (bundle minus
+          # the multi-GB blob, which stays reproducible from these products)
+          if [ -d products/kernel/ramdeploy ]; then
+            mkdir -p products/ramdeploy-bootset
+            cp products/kernel/ramdeploy/{bootcfg,kernel,dtb,initrd,initrd_debug}_ramdeploy.bin \
+               products/ramdeploy-bootset/ 2>/dev/null || true
+            cp products/bootloader/TestBootApp.efi products/ramdeploy-bootset/ 2>/dev/null || true
+            cp products/kernel/tools/deployclient products/ramdeploy-bootset/ 2>/dev/null || true
+          fi
+          mkdir -p dist
+          tar --use-compress-program='zstd -3 -T0' \
+              -cf "dist/iceland-main-build-${GITHUB_SHA}.tar.zst" -C products .
+          ( cd dist && sha256sum *.tar.zst > SHA256SUMS.archive )
+          du -h dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iceland-main-build-${{ github.sha }}
+          retention-days: 14
+          compression-level: 0     # payload is already zstd
           path: dist
