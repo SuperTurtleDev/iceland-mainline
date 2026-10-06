@@ -1,15 +1,15 @@
 name: main build
 
-# Structure:
-#   checkout (前置, once for the whole workflow)
-#     └─> bl-kernel   ─┐  (buildbl -> buildkernel; initrd embeds bl's esp.img)
-#     └─> userspace   ─┤  (independent, parallel with bl-kernel)
-#            package  <┘  (single compressed archive of all products)
+# Two independent chains in parallel; products gathered by the final job:
 #
-# The checkout job does the one recursive clone (submodules incl. the
-# kernel's nested linux/firmware) and ships the workspace as an artifact;
-# the build jobs extract it instead of cloning again.  The final job packs
-# every phase product into ONE tar.zst and uploads that.
+#   bl-kernel    buildbl.sh -> buildkernel.sh (kernel strictly after bl:
+#                the netdeploy initrd embeds bl's esp.img)
+#   userspace    builduserspace.sh
+#   package      downloads both chains' products -> ONE tar.zst
+#
+# Each job clones its own repos directly (main repo for scripts/, plus the
+# subsystem repos with THEIR own recursive submodules in place, so every
+# gitfile resolves naturally -- no workspace tar with nested .git dirs).
 
 on:
   push:
@@ -22,49 +22,24 @@ permissions:
   contents: read
 
 jobs:
-  checkout:
+  bl-kernel:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 90
     steps:
-      - name: reclaim disk
+      - name: reclaim disk (kernel tree + container are heavy)
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                        /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive   # bootloader, kernel (+linux+firmware), userspace, container
-
-      - name: "pack workspace (git dirs included — builds read SOURCE_DATE_EPOCH)"
+      - name: clone main + kernel (recursive) + container
         run: |
-          # build outside the tree so the archive cannot include itself,
-          # then move it back inside the workspace: upload-artifact
-          # rejects paths containing '..'
-          tar --use-compress-program='zstd -3 -T0' -cf ../workspace.tar.zst .
-          mv ../workspace.tar.zst ./workspace.tar.zst
-          du -h ./workspace.tar.zst
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: workspace
-          retention-days: 1
-          compression-level: 0     # payload is already zstd
-          path: workspace.tar.zst
-
-  bl-kernel:
-    needs: checkout
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/download-artifact@v4
-        with: { name: workspace }
-
-      - name: extract workspace
-        run: |
-          mkdir -p ws && tar --use-compress-program='zstd -T0' -xf workspace.tar.zst -C ws
-          rm workspace.tar.zst
-          df -h /
+          git clone --depth 1 https://github.com/SuperTurtleDev/iceland-mainline.git .
+          git clone --depth 1 --recursive --shallow-submodules \
+            https://github.com/SuperTurtleDev/iceland-mainline-kernel.git kernel
+          git clone --depth 1 \
+            https://github.com/SuperTurtleDev/iceland-build-container.git podman_container
+          git submodule status
 
       - name: rootless podman prereqs
         run: |
@@ -72,23 +47,21 @@ jobs:
           podman info >/dev/null && echo podman-ok
 
       - name: buildbl.sh
-        working-directory: ws
         run: bash scripts/buildbl.sh
 
       - name: "buildkernel.sh (after bl — initrd embeds bl's esp.img)"
-        working-directory: ws
         run: bash scripts/buildkernel.sh
 
       - name: stage products
         run: |
-          K=ws/../build/kernel
+          K=../build/kernel
           mkdir -p out/kernel
           cp "$K"/SHA256SUMS out/kernel/ 2>/dev/null || true
           cp "$K"/*.img "$K"/*.tar.gz out/kernel/ 2>/dev/null || true
           cp "$K"/initrd_deploy_net_*.cpio.zst out/kernel/ 2>/dev/null || true
           cp -r "$K"/debs "$K"/tools "$K"/ramdeploy "$K"/charge out/kernel/ 2>/dev/null || true
           # bootloader products for the package job (stub: nothing yet)
-          BL=ws/../build/bootloader
+          BL=../build/bootloader
           mkdir -p out/bootloader
           cp "$BL"/TestBootApp.efi "$BL"/BootApp.efi "$BL"/BootUtil.efi "$BL"/esp.img \
              out/bootloader/ 2>/dev/null || true
@@ -101,25 +74,21 @@ jobs:
           path: out
 
   userspace:
-    needs: checkout
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/download-artifact@v4
-        with: { name: workspace }
-
-      - name: extract workspace
+      - name: clone main + userspace
         run: |
-          mkdir -p ws && tar --use-compress-program='zstd -T0' -xf workspace.tar.zst -C ws
-          rm workspace.tar.zst
+          git clone --depth 1 https://github.com/SuperTurtleDev/iceland-mainline.git .
+          git clone --depth 1 --recursive --shallow-submodules \
+            https://github.com/SuperTurtleDev/iceland-mainline-userspace.git userspace
 
       - name: builduserspace.sh
-        working-directory: ws
         run: bash scripts/builduserspace.sh
 
       - name: stage products
         run: |
-          U=ws/../build/userspace
+          U=../build/userspace
           mkdir -p out/userspace
           ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) > out/userspace/SHA256SUMS.images || true
           cp "$U"/SHA256SUMS "$U"/buildinfo.txt out/userspace/ 2>/dev/null || true
@@ -144,8 +113,8 @@ jobs:
 
       - name: single product archive
         run: |
-          # the ramdeploy boot set from the assembly contract (bundle minus
-          # the multi-GB blob, which stays reproducible from these products)
+          # the ramdeploy boot set (bundle minus the multi-GB blob, which
+          # stays reproducible from these products)
           if [ -d products/kernel/ramdeploy ]; then
             mkdir -p products/ramdeploy-bootset
             cp products/kernel/ramdeploy/{bootcfg,kernel,dtb,initrd,initrd_debug}_ramdeploy.bin \
