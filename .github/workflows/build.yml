@@ -77,13 +77,21 @@ jobs:
 
   userspace:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: clone main + userspace
         run: |
           git clone --depth 1 https://github.com/SuperTurtleDev/iceland-mainline.git .
           git clone --depth 1 --recursive --shallow-submodules \
             https://github.com/SuperTurtleDev/iceland-mainline-userspace.git userspace
+
+      - name: qemu-user-static (arm64 debootstrap on x86 runners)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends qemu-user-static binfmt-support
+          ls /proc/sys/fs/binfmt_misc/ | grep -i aarch64 \
+            || sudo update-binfmts --enable qemu-aarch64
+          ls /proc/sys/fs/binfmt_misc/ | grep -i aarch64
 
       - name: builduserspace.sh
         run: bash scripts/builduserspace.sh
