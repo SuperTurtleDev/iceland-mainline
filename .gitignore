@@ -1,7 +1,2 @@
-# subsystem repos (independent; wire as submodules if ever needed)
-/bootloader/
-/kernel/
-/userspace/
-/podman_container/
 # python bytecode from local tooling
 __pycache__/

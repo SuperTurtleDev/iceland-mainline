@@ -1,0 +1,16 @@
+[submodule "bootloader"]
+	path = bootloader
+	url = https://github.com/SuperTurtleDev/iceland-mainline-bootloader.git
+	branch = main
+[submodule "kernel"]
+	path = kernel
+	url = https://github.com/SuperTurtleDev/iceland-mainline-kernel.git
+	branch = main
+[submodule "userspace"]
+	path = userspace
+	url = https://github.com/SuperTurtleDev/iceland-mainline-userspace.git
+	branch = main
+[submodule "podman_container"]
+	path = podman_container
+	url = https://github.com/SuperTurtleDev/iceland-build-container.git
+	branch = main
