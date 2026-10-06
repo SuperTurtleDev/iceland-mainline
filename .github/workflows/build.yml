@@ -38,15 +38,19 @@ jobs:
 
       - name: "pack workspace (git dirs included — builds read SOURCE_DATE_EPOCH)"
         run: |
+          # build outside the tree so the archive cannot include itself,
+          # then move it back inside the workspace: upload-artifact
+          # rejects paths containing '..'
           tar --use-compress-program='zstd -3 -T0' -cf ../workspace.tar.zst .
-          du -h ../workspace.tar.zst
+          mv ../workspace.tar.zst ./workspace.tar.zst
+          du -h ./workspace.tar.zst
 
       - uses: actions/upload-artifact@v4
         with:
           name: workspace
           retention-days: 1
           compression-level: 0     # payload is already zstd
-          path: ../workspace.tar.zst
+          path: workspace.tar.zst
 
   bl-kernel:
     needs: checkout
