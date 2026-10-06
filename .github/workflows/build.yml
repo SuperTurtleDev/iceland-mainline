@@ -1,15 +1,17 @@
 name: main build
 
-# Main meta-repo CI: phases bl -> kernel -> userspace, then the
-# desktop-fastcharge ramdeploy assembly into ../artifacts/ramdeploy.
+# Main meta-repo CI.  Two independent chains run in PARALLEL:
 #
-# The tree layout after the recursive checkout matches the workstation
-# exactly (bootloader/kernel/userspace/podman_container as siblings), so
-# kernel/build.sh finds ../podman_container and ../bootloader naturally.
+#   bl-kernel    buildbl.sh -> buildkernel.sh (kernel strictly after bl:
+#                the netdeploy initrd embeds bl's esp.img)
+#   userspace    builduserspace.sh
 #
-# Phase scripts that are still owner stubs produce nothing; the assembly
-# then degrades to a workflow WARNING instead of failing the build, so the
-# CI is green while the subsystem owners fill in their parts.  Real build
+# The final ramdeploy assembly (blob packing) stays on the workstation
+# ./build.sh for now: it needs both chains' outputs on one machine and the
+# userspace sparse alone is ~4 GB of cross-job artifact transfer.  The
+# kernel artifacts needed for it are uploaded by the bl-kernel job.
+#
+# Phase scripts that are still owner stubs produce nothing; real build
 # failures fail the job.
 
 on:
@@ -23,10 +25,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  bl-kernel:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-
     steps:
       - name: reclaim disk (kernel tree + container are heavy)
         run: |
@@ -43,42 +44,54 @@ jobs:
           sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
           podman info >/dev/null && echo podman-ok
 
-      - name: phases + assembly (./build.sh)
-        run: |
-          set -o pipefail
-          if ! ./build.sh 2>&1 | tee build.log; then
-            if grep -q 'phase output missing' build.log; then
-              echo "::warning::assembly skipped: a phase is still a stub (see contracts in scripts/*.sh)"
-            else
-              exit 1
-            fi
-          fi
+      - name: buildbl.sh
+        run: bash scripts/buildbl.sh
 
-      - name: collect artifacts
+      - name: buildkernel.sh (after bl: initrd embeds bl's esp.img)
+        run: bash scripts/buildkernel.sh
+
+      - name: collect kernel artifacts
         run: |
-          mkdir -p dist
-          # ramdeploy bundle (present once every phase contract is met)
-          if [ -d ../artifacts/ramdeploy ]; then
-            mkdir -p dist/ramdeploy-upload
-            # the 4 GB blob exceeds artifact limits; ship the boot set +
-            # script + checksums, the blob is reproducible from the phase
-            # outputs
-            cp ../artifacts/ramdeploy/{TestBootApp.efi,*_ramdeploy.bin,deployclient,ramdeploy.sh,SHA256SUMS} \
-               dist/ramdeploy-upload/ 2>/dev/null || true
-          fi
-          # kernel phase outputs (always present: the phase is implemented)
           K=../build/kernel
-          if [ -f "$K/kernel.img" ]; then
-            mkdir -p dist/kernel
-            cp "$K"/SHA256SUMS "$K"/*.img "$K"/*.tar.gz dist/kernel/ 2>/dev/null || true
-            cp "$K"/initrd_deploy_net_*.cpio.zst dist/kernel/ 2>/dev/null || true
-            cp -r "$K"/debs "$K"/tools "$K"/ramdeploy dist/kernel/ 2>/dev/null || true
-          fi
-          du -sh dist || echo "no artifacts collected"
+          mkdir -p dist
+          cp "$K"/SHA256SUMS dist/ 2>/dev/null || true
+          cp "$K"/*.img "$K"/*.tar.gz dist/ 2>/dev/null || true
+          cp "$K"/initrd_deploy_net_*.cpio.zst dist/ 2>/dev/null || true
+          cp -r "$K"/debs "$K"/tools "$K"/ramdeploy dist/ 2>/dev/null || true
+          du -sh dist
 
       - uses: actions/upload-artifact@v4
         with:
-          name: main-build-${{ github.sha }}
+          name: kernel-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: error
+          path: dist
+
+  userspace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: builduserspace.sh
+        run: bash scripts/builduserspace.sh
+
+      - name: collect userspace artifacts
+        run: |
+          U=../build/userspace
+          mkdir -p dist
+          # manifest only: the sparse rootfs images are multi-GB and stay
+          # reproducible from the userspace repo build
+          ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) > dist/SHA256SUMS.userspace || true
+          cp "$U"/SHA256SUMS dist/ 2>/dev/null || true
+          cp "$U"/buildinfo.txt dist/ 2>/dev/null || true
+          cat dist/SHA256SUMS.userspace 2>/dev/null || echo "no userspace outputs (stub phase?)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userspace-${{ github.sha }}
           retention-days: 14
           if-no-files-found: ignore
           path: dist
