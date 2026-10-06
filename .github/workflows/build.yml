@@ -1,0 +1,84 @@
+name: main build
+
+# Main meta-repo CI: phases bl -> kernel -> userspace, then the
+# desktop-fastcharge ramdeploy assembly into ../artifacts/ramdeploy.
+#
+# The tree layout after the recursive checkout matches the workstation
+# exactly (bootloader/kernel/userspace/podman_container as siblings), so
+# kernel/build.sh finds ../podman_container and ../bootloader naturally.
+#
+# Phase scripts that are still owner stubs produce nothing; the assembly
+# then degrades to a workflow WARNING instead of failing the build, so the
+# CI is green while the subsystem owners fill in their parts.  Real build
+# failures fail the job.
+
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: reclaim disk (kernel tree + container are heavy)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                       /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # bootloader, kernel (+linux+firmware), userspace, container
+
+      - name: rootless podman prereqs
+        run: |
+          sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+          podman info >/dev/null && echo podman-ok
+
+      - name: phases + assembly (./build.sh)
+        run: |
+          set -o pipefail
+          if ! ./build.sh 2>&1 | tee build.log; then
+            if grep -q 'phase output missing' build.log; then
+              echo "::warning::assembly skipped: a phase is still a stub (see contracts in scripts/*.sh)"
+            else
+              exit 1
+            fi
+          fi
+
+      - name: collect artifacts
+        run: |
+          mkdir -p dist
+          # ramdeploy bundle (present once every phase contract is met)
+          if [ -d ../artifacts/ramdeploy ]; then
+            mkdir -p dist/ramdeploy-upload
+            # the 4 GB blob exceeds artifact limits; ship the boot set +
+            # script + checksums, the blob is reproducible from the phase
+            # outputs
+            cp ../artifacts/ramdeploy/{TestBootApp.efi,*_ramdeploy.bin,deployclient,ramdeploy.sh,SHA256SUMS} \
+               dist/ramdeploy-upload/ 2>/dev/null || true
+          fi
+          # kernel phase outputs (always present: the phase is implemented)
+          K=../build/kernel
+          if [ -f "$K/kernel.img" ]; then
+            mkdir -p dist/kernel
+            cp "$K"/SHA256SUMS "$K"/*.img "$K"/*.tar.gz dist/kernel/ 2>/dev/null || true
+            cp "$K"/initrd_deploy_net_*.cpio.zst dist/kernel/ 2>/dev/null || true
+            cp -r "$K"/debs "$K"/tools "$K"/ramdeploy dist/kernel/ 2>/dev/null || true
+          fi
+          du -sh dist || echo "no artifacts collected"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: main-build-${{ github.sha }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: dist
