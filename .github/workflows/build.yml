@@ -1,15 +1,10 @@
 name: main build
 
-# Two independent chains in parallel; products gathered by the final job:
-#
-#   bl-kernel    buildbl.sh -> buildkernel.sh (kernel strictly after bl:
-#                the netdeploy initrd embeds bl's esp.img)
-#   userspace    builduserspace.sh
-#   package      downloads both chains' products -> ONE tar.zst
-#
-# Each job clones its own repos directly (main repo for scripts/, plus the
-# subsystem repos with THEIR own recursive submodules in place, so every
-# gitfile resolves naturally -- no workspace tar with nested .git dirs).
+# Structure:
+#   checkout (前置, once for the whole workflow)
+#     └─> bl-kernel   ─┐  (buildbl -> buildkernel; initrd embeds bl's esp.img)
+#     └─> userspace   ─┤  (rootfs sparse image, compressed for upload)
+#            package  <┘  (deploy blob + ramdeploy bundle, single artifact)
 
 on:
   push:
@@ -32,7 +27,7 @@ jobs:
                        /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: clone main + kernel (recursive) + container
+      - name: clone main + kernel (recursive) + bl + container
         run: |
           git clone --depth 1 https://github.com/SuperTurtleDev/iceland-mainline.git .
           git clone --depth 1 --recursive --shallow-submodules \
@@ -41,7 +36,6 @@ jobs:
             https://github.com/SuperTurtleDev/iceland-mainline-bootloader.git bootloader
           git clone --depth 1 \
             https://github.com/SuperTurtleDev/iceland-build-container.git podman_container
-          git submodule status
 
       - name: rootless podman prereqs
         run: |
@@ -57,14 +51,12 @@ jobs:
       - name: stage products
         run: |
           K=../build/kernel
-          mkdir -p out/kernel
+          mkdir -p out/kernel out/bootloader
           cp "$K"/SHA256SUMS out/kernel/ 2>/dev/null || true
           cp "$K"/*.img "$K"/*.tar.gz out/kernel/ 2>/dev/null || true
           cp "$K"/initrd_deploy_net_*.cpio.zst out/kernel/ 2>/dev/null || true
           cp -r "$K"/debs "$K"/tools "$K"/ramdeploy "$K"/charge out/kernel/ 2>/dev/null || true
-          # bootloader products for the package job (stub: nothing yet)
           BL=../build/bootloader
-          mkdir -p out/bootloader
           cp "$BL"/TestBootApp.efi "$BL"/BootApp.efi "$BL"/BootUtil.efi "$BL"/esp.img \
              out/bootloader/ 2>/dev/null || true
           du -sh out
@@ -89,60 +81,112 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends qemu-user-static
-          # reset binfmt with the multiarch image's current static qemu:
-          # the apt registration left guest stat/statx calls failing with
-          # ENOSYS (tar: "Cannot stat: Function not implemented" wholesale)
           docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
           ls /proc/sys/fs/binfmt_misc/ | grep -i aarch64
 
       - name: builduserspace.sh
         run: bash scripts/builduserspace.sh
 
-      - name: stage products
+      - name: stage products (compressed sparse image + info)
         run: |
           U=../build/userspace
           mkdir -p out/userspace
-          ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) > out/userspace/SHA256SUMS.images || true
+          # compress each sparse image for upload (sparse ext4 has lots of
+          # zeros; zstd typically halves the size)
+          for img in "$U"/*.sparse.img; do
+            [ -f "$img" ] || continue
+            zstd -3 -T0 -q -o "out/userspace/$(basename "$img").zst" "$img"
+            echo "compressed: $(du -h "out/userspace/$(basename "$img").zst")"
+          done
+          ( cd "$U" 2>/dev/null && sha256sum *.sparse.img *.img 2>/dev/null ) \
+            > out/userspace/SHA256SUMS.images || true
           cp "$U"/SHA256SUMS "$U"/buildinfo.txt out/userspace/ 2>/dev/null || true
-          cat out/userspace/SHA256SUMS.images 2>/dev/null || echo "no userspace outputs (stub phase?)"
+          du -sh out/userspace/
 
       - uses: actions/upload-artifact@v4
         with:
           name: products-userspace
           retention-days: 3
-          if-no-files-found: ignore
           path: out
 
   package:
     needs: [bl-kernel, userspace]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/download-artifact@v4
         with: { name: products-bl-kernel, path: products }
       - uses: actions/download-artifact@v4
         with: { name: products-userspace, path: products }
 
-      - name: single product archive
+      - name: assemble deploy bundle (blob + ramdeploy)
         run: |
-          # the ramdeploy boot set (bundle minus the multi-GB blob, which
-          # stays reproducible from these products)
-          if [ -d products/kernel/ramdeploy ]; then
-            mkdir -p products/ramdeploy-bootset
-            cp products/kernel/ramdeploy/{bootcfg,kernel,dtb,initrd,initrd_debug}_ramdeploy.bin \
-               products/ramdeploy-bootset/ 2>/dev/null || true
-            cp products/bootloader/TestBootApp.efi products/ramdeploy-bootset/ 2>/dev/null || true
-            cp products/kernel/tools/deployclient products/ramdeploy-bootset/ 2>/dev/null || true
+          set -e
+          # decompress the sparse rootfs
+          mkdir -p work
+          for zst in products/userspace/*.sparse.img.zst; do
+            [ -f "$zst" ] || continue
+            base="${zst%.zst}"
+            zstd -d -T0 -q -o "work/$(basename "$base")" "$zst"
+          done
+          SPARSE=$(find work -name '*.sparse.img' | head -1)
+          echo "rootfs: $SPARSE ($(du -h "$SPARSE" 2>/dev/null || echo '?'))"
+
+          # build the deploy blob (rootfs + 4 kernel debs)
+          BLOB=""
+          if [ -n "$SPARSE" ] && [ -d products/kernel/debs ] && \
+             [ -x products/kernel/tools/makeblob ]; then
+            BLOB=deploy.blob
+            products/kernel/tools/makeblob -o "work/$BLOB" "$SPARSE" \
+              products/kernel/debs/linux-firmware-iceland*_arm64.deb \
+              products/kernel/debs/linux-headers-*_arm64.deb \
+              products/kernel/debs/linux-image-*_arm64.deb \
+              products/kernel/debs/linux-modules-*_arm64.deb
+            echo "blob: $(du -h "work/$BLOB")"
+          else
+            echo "WARNING: cannot build blob (missing sparse/debs/makeblob)"
           fi
-          mkdir -p dist
-          tar --use-compress-program='zstd -3 -T0' \
-              -cf "dist/iceland-main-build-${GITHUB_SHA}.tar.zst" -C products .
-          ( cd dist && sha256sum *.tar.zst > SHA256SUMS.archive )
-          du -h dist/*
+
+          # self-contained ramdeploy bundle
+          mkdir -p dist/ramdeploy
+          cp products/kernel/ramdeploy/*_ramdeploy.bin dist/ramdeploy/ 2>/dev/null || true
+          cp products/bootloader/TestBootApp.efi dist/ramdeploy/ 2>/dev/null || true
+          cp products/kernel/tools/deployclient dist/ramdeploy/ 2>/dev/null || true
+          [ -n "$BLOB" ] && cp "work/$BLOB" dist/ramdeploy/
+
+          cat > dist/ramdeploy/ramdeploy.sh << 'EOS'
+          #!/usr/bin/env bash
+          # One-shot RAM deploy: device in TestBootApp fastboot (8B0C705).
+          # Run from this directory: ./ramdeploy.sh [deploy.blob] [debug]
+          set -eu
+          D=$(cd "$(dirname "$0")" && pwd)
+          BLOB="${1:-$D/deploy.blob}"
+          INITRD=initrd_ramdeploy.bin
+          [ "${2:-}" = debug ] && INITRD=initrd_debug_ramdeploy.bin
+          fastboot flash bootcfg "$D/bootcfg_ramdeploy.bin"
+          fastboot flash kernel   "$D/kernel_ramdeploy.bin"
+          fastboot flash dtb      "$D/dtb_ramdeploy.bin"
+          fastboot flash initrd   "$D/$INITRD"
+          fastboot continue || true
+          echo "== waiting for deploy NCM (60 s)..."
+          for i in $(seq 15); do ip -o addr show 2>/dev/null | grep -q 'enx.*192.168.42' && break; sleep 4; done
+          ip -4 -o addr show | grep 192.168.42 | head -1
+          "$D/deployclient" 192.168.42.42 5190 "$BLOB"
+          EOS
+          chmod +x dist/ramdeploy/ramdeploy.sh
+
+          ( cd dist/ramdeploy && sha256sum TestBootApp.efi *_ramdeploy.bin deployclient deploy.blob ramdeploy.sh > SHA256SUMS 2>/dev/null || \
+            ( cd dist/ramdeploy && sha256sum * > SHA256SUMS ) )
+
+          # also ship the kernel deb set alongside for packages-only updates
+          mkdir -p dist/kernel-products
+          cp -r products/kernel/debs dist/kernel-products/ 2>/dev/null || true
+          cp products/kernel/tools/makeblob dist/kernel-products/ 2>/dev/null || true
+
+          du -h dist/ramdeploy/* | tail -5
 
       - uses: actions/upload-artifact@v4
         with:
-          name: iceland-main-build-${{ github.sha }}
+          name: iceland-deploy-${{ github.sha }}
           retention-days: 14
-          compression-level: 0     # payload is already zstd
           path: dist
