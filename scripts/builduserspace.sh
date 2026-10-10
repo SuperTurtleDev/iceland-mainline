@@ -31,7 +31,9 @@ die() { log "ERROR: $*"; exit 1; }
 
 [ -x "${SRC}/userspace/build.sh" ] || die "userspace/build.sh missing"
 
-PRESENTS="${PRESENTS-ubuntu_desktop,fastcharge}"
+# :- default so an ambiently-exported EMPTY PRESENTS still means "default"
+# (a bare - default keeps the empty string and silently builds the base)
+PRESENTS="${PRESENTS:-ubuntu_desktop,fastcharge}"
 
 # the userspace repo's own orchestrator: host debootstrap + presets +
 # verify gate; artifacts default to exactly the contract location above
