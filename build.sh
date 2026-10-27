@@ -32,6 +32,11 @@ K_OUT="${MAINLINE}/build/kernel"
 U_OUT="${MAINLINE}/build/userspace"
 LOGS="${MAINLINE}/build/logs"
 ART="${SRC}/../artifacts/ramdeploy"
+source "${SRC}/kernel/scripts/kernel-version.sh"
+KERNEL_DEBS=()
+for package in firmware headers image modules tools; do
+    KERNEL_DEBS+=("${K_OUT}/debs/linux-${package}-iceland_${VER}_arm64.deb")
+done
 
 log() { printf '[main-build] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -60,10 +65,7 @@ for f in bootcfg_ramdeploy.bin kernel_ramdeploy.bin dtb_ramdeploy.bin \
 done
 need "${K_OUT}/tools/deployclient"
 need "${K_OUT}/tools/makeblob"
-for f in "${K_OUT}"/debs/linux-firmware-iceland*_arm64.deb \
-         "${K_OUT}"/debs/linux-headers-*_arm64.deb \
-         "${K_OUT}"/debs/linux-image-*_arm64.deb \
-         "${K_OUT}"/debs/linux-modules-*_arm64.deb; do
+for f in "${KERNEL_DEBS[@]}"; do
     need "$f"
 done
 SPARSE="${U_OUT}/rootfs-ubuntu_desktop-fastcharge.sparse.img"
@@ -82,12 +84,8 @@ cp -f "${K_OUT}/ramdeploy/bootcfg_ramdeploy.bin" \
       "${ART}/"
 cp -f "${K_OUT}/tools/deployclient" "${ART}/"
 
-log "packing deploy.blob (desktop-fastcharge rootfs + 4 debs)"
-"${K_OUT}/tools/makeblob" -o "${ART}/deploy.blob" "${SPARSE}" \
-    "${K_OUT}"/debs/linux-firmware-iceland*_arm64.deb \
-    "${K_OUT}"/debs/linux-headers-*_arm64.deb \
-    "${K_OUT}"/debs/linux-image-*_arm64.deb \
-    "${K_OUT}"/debs/linux-modules-*_arm64.deb
+log "packing deploy.blob (desktop-fastcharge rootfs + 5 debs, ${VER})"
+"${K_OUT}/tools/makeblob" -o "${ART}/deploy.blob" "${SPARSE}" "${KERNEL_DEBS[@]}"
 
 cat > "${ART}/ramdeploy.sh" <<'EOS'
 #!/usr/bin/env bash

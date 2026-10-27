@@ -10,12 +10,13 @@
 #     ramdeploy/{bootcfg,kernel,dtb,initrd,initrd_debug}_ramdeploy.bin
 #                 RAW (no BootApp prefix) TestBootApp RAM-staging set
 #     tools/makeblob  tools/deployclient      host deploy tools
-#     debs/linux-{firmware-iceland,headers,image,modules}_*_arm64.deb
+#     debs/linux-{firmware-iceland,headers,image,modules,tools}_*_arm64.deb
 #     kernel.img dtb.img initrd_debug.img initrd_charge.img  (+ .img set)
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${SRC}/../build/kernel"
+source "${SRC}/kernel/scripts/kernel-version.sh"
 
 log() { printf '[buildkernel] %s\n' "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
@@ -44,8 +45,8 @@ for f in \
     kernel.img dtb.img initrd_debug.img initrd_charge.img; do
     [ -e "${OUT}/${f}" ] || die "contract output missing after build: ${f}"
 done
-for g in linux-firmware-iceland*_arm64.deb linux-headers-*_arm64.deb \
-         linux-image-*_arm64.deb linux-modules-*_arm64.deb; do
-    ls "${OUT}"/debs/${g} >/dev/null 2>&1 || die "contract output missing: debs/${g}"
+for package in firmware headers image modules tools; do
+    deb="debs/linux-${package}-iceland_${VER}_arm64.deb"
+    [ -f "${OUT}/${deb}" ] || die "contract output missing: ${deb}"
 done
 log "contract outputs verified in ${OUT}"
